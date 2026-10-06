@@ -16,6 +16,10 @@
       "command": "go run ./cmd/workflowcheck --workflow register-device"
     },
     {
+      "workflow_id": "publish-regulation",
+      "command": "go run ./cmd/workflowcheck --workflow publish-regulation"
+    },
+    {
       "workflow_id": "open-verification-case",
       "command": "go run ./cmd/workflowcheck --workflow open-verification-case"
     },
@@ -26,6 +30,10 @@
     {
       "workflow_id": "reopen-verification-case",
       "command": "go run ./cmd/workflowcheck --workflow reopen-verification-case"
+    },
+    {
+      "workflow_id": "regulation-supersede",
+      "command": "go run ./cmd/workflowcheck --workflow regulation-supersede"
     },
     {
       "workflow_id": "seal-verification",

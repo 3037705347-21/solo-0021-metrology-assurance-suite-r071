@@ -3,10 +3,23 @@ package repository
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 
 	"example.com/solo-0021-metrology-assurance-suite/internal/domain"
 )
+
+// Reader is the shared read view implemented by both Snapshot and Mutation,
+// so response builders can run unchanged inside reads and writes.
+type Reader interface {
+	Device(id string) (domain.Device, bool)
+	Case(id string) (domain.VerificationCase, bool)
+	Measurements(caseID string) []domain.Measurement
+	Seal(caseID string) (domain.EvidenceSeal, bool)
+	Events(caseID string) []domain.AuditEvent
+	Regulation(id string) (domain.RegulationVersion, bool)
+	RegulationsForModel(deviceModel string) []domain.RegulationVersion
+}
 
 type Repository struct {
 	mu           sync.RWMutex
@@ -14,6 +27,7 @@ type Repository struct {
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	regulations  map[string]domain.RegulationVersion
 	events       []domain.AuditEvent
 	counters     map[string]int
 }
@@ -24,6 +38,7 @@ func New() *Repository {
 		cases:        make(map[string]domain.VerificationCase),
 		measurements: make(map[string][]domain.Measurement),
 		seals:        make(map[string]domain.EvidenceSeal),
+		regulations:  make(map[string]domain.RegulationVersion),
 		counters:     make(map[string]int),
 	}
 }
@@ -33,6 +48,7 @@ type Snapshot struct {
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	regulations  map[string]domain.RegulationVersion
 	events       []domain.AuditEvent
 }
 
@@ -74,6 +90,15 @@ func (s Snapshot) Events(caseID string) []domain.AuditEvent {
 	return result
 }
 
+func (s Snapshot) Regulation(id string) (domain.RegulationVersion, bool) {
+	item, ok := s.regulations[id]
+	return item, ok
+}
+
+func (s Snapshot) RegulationsForModel(deviceModel string) []domain.RegulationVersion {
+	return regulationsForModel(s.regulations, deviceModel)
+}
+
 func (s Snapshot) AllDevices() []domain.Device {
 	result := make([]domain.Device, 0, len(s.devices))
 	for _, item := range s.devices {
@@ -90,11 +115,16 @@ func (s Snapshot) AllCases() []domain.VerificationCase {
 	return result
 }
 
+func (s Snapshot) AllRegulations() []domain.RegulationVersion {
+	return sortRegulations(allRegulations(s.regulations))
+}
+
 type Mutation struct {
 	devices      map[string]domain.Device
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	regulations  map[string]domain.RegulationVersion
 	events       []domain.AuditEvent
 	counters     map[string]int
 }
@@ -164,6 +194,26 @@ func (m *Mutation) ActiveCaseForDevice(deviceID string) (domain.VerificationCase
 	return domain.VerificationCase{}, false
 }
 
+// UnfinishedCasesForModel returns every unfinished case whose device belongs
+// to the given model, ordered by case id for deterministic sweeps.
+func (m *Mutation) UnfinishedCasesForModel(deviceModel string) []domain.VerificationCase {
+	var result []domain.VerificationCase
+	for _, item := range m.cases {
+		if !item.IsUnfinished() {
+			continue
+		}
+		device, exists := m.devices[item.DeviceID]
+		if !exists {
+			continue
+		}
+		if domain.NormalizeModel(device.Model) == domain.NormalizeModel(deviceModel) {
+			result = append(result, item)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+	return result
+}
+
 func (m *Mutation) AppendMeasurement(item domain.Measurement) error {
 	if _, exists := m.cases[item.CaseID]; !exists {
 		return fmt.Errorf("%w: case %s", domain.ErrNotFound, item.CaseID)
@@ -186,6 +236,23 @@ func (m *Mutation) PutSeal(item domain.EvidenceSeal) error {
 		return fmt.Errorf("%w: case %s", domain.ErrSealAlreadyCreated, item.CaseID)
 	}
 	m.seals[item.CaseID] = item
+	return nil
+}
+
+func (m *Mutation) Regulation(id string) (domain.RegulationVersion, bool) {
+	item, ok := m.regulations[id]
+	return item, ok
+}
+
+func (m *Mutation) RegulationsForModel(deviceModel string) []domain.RegulationVersion {
+	return regulationsForModel(m.regulations, deviceModel)
+}
+
+func (m *Mutation) PutRegulation(item domain.RegulationVersion) error {
+	if _, exists := m.regulations[item.ID]; exists {
+		return fmt.Errorf("%w: regulation %s", domain.ErrStateConflict, item.ID)
+	}
+	m.regulations[item.ID] = item
 	return nil
 }
 
@@ -224,6 +291,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
+		regulations:  cloneRegulations(r.regulations),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 		counters:     cloneCounters(r.counters),
 	}
@@ -234,6 +302,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	r.cases = next.cases
 	r.measurements = next.measurements
 	r.seals = next.seals
+	r.regulations = next.regulations
 	r.events = next.events
 	r.counters = next.counters
 	return nil
@@ -245,8 +314,38 @@ func (r *Repository) snapshot() Snapshot {
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
+		regulations:  cloneRegulations(r.regulations),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 	}
+}
+
+func regulationsForModel(regulations map[string]domain.RegulationVersion, deviceModel string) []domain.RegulationVersion {
+	key := domain.NormalizeModel(deviceModel)
+	var result []domain.RegulationVersion
+	for _, item := range regulations {
+		if domain.NormalizeModel(item.DeviceModel) == key {
+			result = append(result, item)
+		}
+	}
+	return sortRegulations(result)
+}
+
+func allRegulations(regulations map[string]domain.RegulationVersion) []domain.RegulationVersion {
+	result := make([]domain.RegulationVersion, 0, len(regulations))
+	for _, item := range regulations {
+		result = append(result, item)
+	}
+	return result
+}
+
+func sortRegulations(items []domain.RegulationVersion) []domain.RegulationVersion {
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].EffectiveFrom.Equal(items[j].EffectiveFrom) {
+			return items[i].ID < items[j].ID
+		}
+		return items[i].EffectiveFrom.Before(items[j].EffectiveFrom)
+	})
+	return items
 }
 
 func cloneDevices(values map[string]domain.Device) map[string]domain.Device {
@@ -275,6 +374,14 @@ func cloneMeasurements(values map[string][]domain.Measurement) map[string][]doma
 
 func cloneSeals(values map[string]domain.EvidenceSeal) map[string]domain.EvidenceSeal {
 	result := make(map[string]domain.EvidenceSeal, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneRegulations(values map[string]domain.RegulationVersion) map[string]domain.RegulationVersion {
+	result := make(map[string]domain.RegulationVersion, len(values))
 	for key, value := range values {
 		result[key] = value
 	}

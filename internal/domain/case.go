@@ -17,29 +17,32 @@ const (
 )
 
 type VerificationCase struct {
-	ID        string     `json:"id"`
-	DeviceID  string     `json:"device_id"`
-	Nominal   float64    `json:"nominal"`
-	Tolerance float64    `json:"tolerance"`
-	Steward   string     `json:"steward"`
-	State     CaseState  `json:"state"`
-	Version   int        `json:"version"`
-	OpenedAt  time.Time  `json:"opened_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
-	SealedAt  *time.Time `json:"sealed_at,omitempty"`
+	ID                       string     `json:"id"`
+	DeviceID                 string     `json:"device_id"`
+	Nominal                  float64    `json:"nominal"`
+	Tolerance                float64    `json:"tolerance"`
+	RegulationVersionID      string     `json:"regulation_version_id"`
+	SupersededByRegulationID string     `json:"superseded_by_regulation_id,omitempty"`
+	Steward                  string     `json:"steward"`
+	State                    CaseState  `json:"state"`
+	Version                  int        `json:"version"`
+	OpenedAt                 time.Time  `json:"opened_at"`
+	UpdatedAt                time.Time  `json:"updated_at"`
+	SealedAt                 *time.Time `json:"sealed_at,omitempty"`
 }
 
-func NewVerificationCase(id, deviceID string, nominal, tolerance float64, steward string, at time.Time) (VerificationCase, error) {
+func NewVerificationCase(id, deviceID string, nominal, tolerance float64, regulationVersionID, steward string, at time.Time) (VerificationCase, error) {
 	item := VerificationCase{
-		ID:        strings.TrimSpace(id),
-		DeviceID:  strings.TrimSpace(deviceID),
-		Nominal:   nominal,
-		Tolerance: tolerance,
-		Steward:   strings.TrimSpace(steward),
-		State:     CaseAwaitingMeasurement,
-		Version:   1,
-		OpenedAt:  at.UTC(),
-		UpdatedAt: at.UTC(),
+		ID:                  strings.TrimSpace(id),
+		DeviceID:            strings.TrimSpace(deviceID),
+		Nominal:             nominal,
+		Tolerance:           tolerance,
+		RegulationVersionID: strings.TrimSpace(regulationVersionID),
+		Steward:             strings.TrimSpace(steward),
+		State:               CaseAwaitingMeasurement,
+		Version:             1,
+		OpenedAt:            at.UTC(),
+		UpdatedAt:           at.UTC(),
 	}
 	if err := item.Validate(); err != nil {
 		return VerificationCase{}, err
@@ -50,6 +53,9 @@ func NewVerificationCase(id, deviceID string, nominal, tolerance float64, stewar
 func (c VerificationCase) Validate() error {
 	if c.ID == "" || c.DeviceID == "" || c.Steward == "" {
 		return fmt.Errorf("%w: case id, device id, and steward are required", ErrInvalidInput)
+	}
+	if c.RegulationVersionID == "" {
+		return fmt.Errorf("%w: case must pin a regulation version", ErrInvalidInput)
 	}
 	if !isFinite(c.Nominal) || !isFinite(c.Tolerance) || c.Tolerance <= 0 {
 		return fmt.Errorf("%w: nominal must be finite and tolerance must be positive", ErrInvalidInput)
@@ -88,6 +94,24 @@ func (c *VerificationCase) Reopen(at time.Time) error {
 		return fmt.Errorf("%w: only a recheck_required case can be reopened", ErrStateConflict)
 	}
 	c.State = CaseAwaitingMeasurement
+	c.Version++
+	c.UpdatedAt = at.UTC()
+	return nil
+}
+
+// MarkRegulationSuperseded flags an unfinished case when a newer regulation
+// version takes effect for its device model. The pinned regulation version
+// never changes: the case keeps being judged by the rule it opened under.
+// Sealed cases are immutable evidence and are never flagged retroactively.
+func (c *VerificationCase) MarkRegulationSuperseded(newRegulationVersionID string, at time.Time) error {
+	if !c.IsUnfinished() {
+		return fmt.Errorf("%w: sealed case evidence cannot be rewritten", ErrStateConflict)
+	}
+	trimmed := strings.TrimSpace(newRegulationVersionID)
+	if trimmed == "" || trimmed == c.RegulationVersionID {
+		return fmt.Errorf("%w: superseding regulation version is required", ErrInvalidInput)
+	}
+	c.SupersededByRegulationID = trimmed
 	c.Version++
 	c.UpdatedAt = at.UTC()
 	return nil

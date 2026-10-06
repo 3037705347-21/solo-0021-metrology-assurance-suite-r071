@@ -10,8 +10,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -36,9 +36,11 @@ func main() {
 
 	checks := map[string]func() error{
 		"register-device":          checkRegisterDevice,
+		"publish-regulation":       checkPublishRegulation,
 		"open-verification-case":   checkOpenVerificationCase,
 		"record-measurement":       checkRecordMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
+		"regulation-supersede":     checkRegulationSupersede,
 		"seal-verification":        checkSealVerification,
 	}
 	run, ok := checks[*workflow]
@@ -112,11 +114,152 @@ func checkRegisterDevice() error {
 	return expectErrorCode(duplicate, "duplicate_asset_tag")
 }
 
+func checkPublishRegulation() error {
+	h := newHarness()
+	defer h.close()
+
+	firstID, err := h.mustPublish("Bench Meter", "R1", 25.0, 0.5)
+	if err != nil {
+		return err
+	}
+
+	duplicate, err := h.publishRegulation("Bench Meter", "r1", 25.0, 0.4)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(duplicate, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(duplicate, "duplicate_regulation_revision"); err != nil {
+		return err
+	}
+
+	invalid, err := h.publishRegulation("Bench Meter", "R2", 25.0, 0)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(invalid, http.StatusBadRequest); err != nil {
+		return err
+	}
+	if err := expectErrorCode(invalid, "invalid_input"); err != nil {
+		return err
+	}
+
+	second, err := h.publishRegulation("Bench Meter", "R2", 25.0, 0.2)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(second, http.StatusCreated); err != nil {
+		return err
+	}
+	secondID, err := nestedString(second.Body, "regulation", "id")
+	if err != nil {
+		return err
+	}
+	current, err := nestedBool(second.Body, "regulation", "current")
+	if err != nil {
+		return err
+	}
+	if !current {
+		return errors.New("newest regulation is not marked current")
+	}
+	superseded, err := nestedSlice(second.Body, "superseded_cases")
+	if err != nil {
+		return err
+	}
+	if len(superseded) != 0 {
+		return fmt.Errorf("no cases exist yet, superseded_cases = %v", superseded)
+	}
+
+	listed, err := h.request(http.MethodGet, "/regulations?model="+url.QueryEscape("bench meter"), nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(listed, http.StatusOK); err != nil {
+		return err
+	}
+	entries, err := nestedSlice(listed.Body, "regulations")
+	if err != nil {
+		return err
+	}
+	if len(entries) != 2 {
+		return fmt.Errorf("expected 2 regulation versions, got %d", len(entries))
+	}
+	firstFrom, err := nestedString(listed.Body, "regulations", 0, "effective_from")
+	if err != nil {
+		return err
+	}
+	firstTo, err := nestedString(listed.Body, "regulations", 0, "effective_to")
+	if err != nil {
+		return err
+	}
+	secondFrom, err := nestedString(listed.Body, "regulations", 1, "effective_from")
+	if err != nil {
+		return err
+	}
+	if firstTo != secondFrom {
+		return fmt.Errorf("first window closes at %q, second opens at %q", firstTo, secondFrom)
+	}
+	if !firstToAfterOrEqual(firstTo, firstFrom) {
+		return fmt.Errorf("effective window %q -> %q is inverted", firstFrom, firstTo)
+	}
+	if _, err := nestedString(listed.Body, "regulations", 1, "effective_to"); err == nil {
+		return errors.New("current regulation must not have effective_to")
+	}
+
+	read, err := h.request(http.MethodGet, "/regulations/"+firstID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(read, http.StatusOK); err != nil {
+		return err
+	}
+	readRevision, err := nestedString(read.Body, "regulation", "revision")
+	if err != nil {
+		return err
+	}
+	if readRevision != "R1" {
+		return fmt.Errorf("read returned revision %q, expected R1", readRevision)
+	}
+
+	secondRead, err := h.request(http.MethodGet, "/regulations/"+secondID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(secondRead, http.StatusOK); err != nil {
+		return err
+	}
+
+	missing, err := h.request(http.MethodGet, "/regulations/regulation-9999", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(missing, http.StatusNotFound); err != nil {
+		return err
+	}
+	return expectErrorCode(missing, "not_found")
+}
+
 func checkOpenVerificationCase() error {
 	h := newHarness()
 	defer h.close()
 
 	deviceID, err := h.createDevice("MET-1101")
+	if err != nil {
+		return err
+	}
+	blocked, err := h.openCase(deviceID)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(blocked, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(blocked, "no_effective_regulation"); err != nil {
+		return err
+	}
+
+	firstRegulation, err := h.mustPublish("Bench Meter", "R1", 25.0, 0.5)
 	if err != nil {
 		return err
 	}
@@ -135,6 +278,59 @@ func checkOpenVerificationCase() error {
 	if state != "awaiting_measurement" {
 		return fmt.Errorf("opened case state = %q", state)
 	}
+	pinned, err := nestedString(opened.Body, "case", "regulation_version_id")
+	if err != nil {
+		return err
+	}
+	if pinned != firstRegulation {
+		return fmt.Errorf("case pinned regulation %q, expected %q", pinned, firstRegulation)
+	}
+	tolerance, err := nestedFloat(opened.Body, "case", "tolerance")
+	if err != nil {
+		return err
+	}
+	if tolerance != 0.5 {
+		return fmt.Errorf("case tolerance = %v, expected 0.5 from regulation R1", tolerance)
+	}
+	basis, err := nestedString(opened.Body, "regulation", "revision")
+	if err != nil {
+		return err
+	}
+	if basis != "R1" {
+		return fmt.Errorf("case detail regulation revision = %q, expected R1", basis)
+	}
+
+	second, err := h.openCase(deviceID)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(second, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(second, "active_case_exists"); err != nil {
+		return err
+	}
+
+	// A later regulation release only governs cases opened afterwards.
+	secondRegulation, err := h.mustPublish("Bench Meter", "R2", 25.0, 0.1)
+	if err != nil {
+		return err
+	}
+	otherDeviceID, err := h.createDevice("MET-1102")
+	if err != nil {
+		return err
+	}
+	otherOpened, err := h.openCase(otherDeviceID)
+	if err != nil {
+		return err
+	}
+	otherPinned, err := nestedString(otherOpened.Body, "case", "regulation_version_id")
+	if err != nil {
+		return err
+	}
+	if otherPinned != secondRegulation {
+		return fmt.Errorf("new case pinned regulation %q, expected %q", otherPinned, secondRegulation)
+	}
 
 	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
 	if err != nil {
@@ -143,26 +339,23 @@ func checkOpenVerificationCase() error {
 	if err := expectStatus(read, http.StatusOK); err != nil {
 		return err
 	}
-
-	second, err := h.request(http.MethodPost, "/cases", map[string]any{
-		"device_id": deviceID,
-		"nominal":   25.0,
-		"tolerance": 0.5,
-		"steward":   "Qiao",
-	})
+	stillPinned, err := nestedString(read.Body, "case", "regulation_version_id")
 	if err != nil {
 		return err
 	}
-	if err := expectStatus(second, http.StatusConflict); err != nil {
-		return err
+	if stillPinned != firstRegulation {
+		return fmt.Errorf("existing case regulation changed to %q after R2 was published", stillPinned)
 	}
-	return expectErrorCode(second, "active_case_exists")
+	return nil
 }
 
 func checkRecordMeasurement() error {
 	h := newHarness()
 	defer h.close()
 
+	if _, err := h.mustPublish("Bench Meter", "R1", 25.0, 0.5); err != nil {
+		return err
+	}
 	deviceID, err := h.createDevice("MET-1201")
 	if err != nil {
 		return err
@@ -195,6 +388,17 @@ func checkRecordMeasurement() error {
 	}
 	if !acceptedValue {
 		return errors.New("in-tolerance measurement was not accepted")
+	}
+	judgedUnder, err := nestedString(accepted.Body, "measurements", 0, "regulation_version_id")
+	if err != nil {
+		return err
+	}
+	pinned, err := nestedString(accepted.Body, "case", "regulation_version_id")
+	if err != nil {
+		return err
+	}
+	if judgedUnder != pinned {
+		return fmt.Errorf("measurement judged under %q, case pinned to %q", judgedUnder, pinned)
 	}
 
 	second, err := h.recordMeasurement(caseID, 25.1, "Rui")
@@ -241,6 +445,45 @@ func checkRecordMeasurement() error {
 	if rejectedValue {
 		return errors.New("out-of-tolerance measurement was accepted")
 	}
+
+	// A case pinned to R1 (tolerance 0.5) keeps its criteria after R2
+	// (tolerance 0.1) takes effect: 25.3 is accepted under R1 only.
+	pinnedDeviceID, err := h.createDevice("MET-1203")
+	if err != nil {
+		return err
+	}
+	pinnedCase, err := h.openCase(pinnedDeviceID)
+	if err != nil {
+		return err
+	}
+	pinnedCaseID, err := nestedString(pinnedCase.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	if _, err := h.mustPublish("Bench Meter", "R2", 25.0, 0.1); err != nil {
+		return err
+	}
+	judged, err := h.recordMeasurement(pinnedCaseID, 25.3, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(judged, http.StatusCreated); err != nil {
+		return err
+	}
+	judgedAccepted, err := nestedBool(judged.Body, "measurements", 0, "accepted")
+	if err != nil {
+		return err
+	}
+	if !judgedAccepted {
+		return errors.New("case was re-judged under the newer regulation instead of its pinned version")
+	}
+	judgedState, err := nestedString(judged.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if judgedState != "review_ready" {
+		return fmt.Errorf("pinned case state = %q, expected review_ready", judgedState)
+	}
 	return nil
 }
 
@@ -248,6 +491,9 @@ func checkReopenVerificationCase() error {
 	h := newHarness()
 	defer h.close()
 
+	if _, err := h.mustPublish("Bench Meter", "R1", 25.0, 0.5); err != nil {
+		return err
+	}
 	caseID, err := h.rejectedCase("MET-1301")
 	if err != nil {
 		return err
@@ -304,10 +550,143 @@ func checkReopenVerificationCase() error {
 	return nil
 }
 
+func checkRegulationSupersede() error {
+	h := newHarness()
+	defer h.close()
+
+	firstRegulation, err := h.mustPublish("Bench Meter", "R1", 25.0, 0.5)
+	if err != nil {
+		return err
+	}
+	deviceA, err := h.createDevice("MET-1501")
+	if err != nil {
+		return err
+	}
+	openedA, err := h.openCase(deviceA)
+	if err != nil {
+		return err
+	}
+	caseA, err := nestedString(openedA.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+
+	// Publishing R2 must flag the in-progress case in the same response.
+	second, err := h.publishRegulation("Bench Meter", "R2", 25.0, 0.2)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(second, http.StatusCreated); err != nil {
+		return err
+	}
+	secondRegulation, err := nestedString(second.Body, "regulation", "id")
+	if err != nil {
+		return err
+	}
+	superseded, err := nestedSlice(second.Body, "superseded_cases")
+	if err != nil {
+		return err
+	}
+	if len(superseded) != 1 || superseded[0] != caseA {
+		return fmt.Errorf("superseded_cases = %v, expected [%s]", superseded, caseA)
+	}
+
+	read, err := h.request(http.MethodGet, "/cases/"+caseA, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(read, http.StatusOK); err != nil {
+		return err
+	}
+	flaggedBy, err := nestedString(read.Body, "case", "superseded_by_regulation_id")
+	if err != nil {
+		return err
+	}
+	if flaggedBy != secondRegulation {
+		return fmt.Errorf("case superseded_by = %q, expected %q", flaggedBy, secondRegulation)
+	}
+	stillPinned, err := nestedString(read.Body, "case", "regulation_version_id")
+	if err != nil {
+		return err
+	}
+	if stillPinned != firstRegulation {
+		return fmt.Errorf("supersede rewrote the pinned regulation to %q", stillPinned)
+	}
+	basis, err := nestedString(read.Body, "regulation", "revision")
+	if err != nil {
+		return err
+	}
+	if basis != "R1" {
+		return fmt.Errorf("case detail regulation revision = %q, expected R1", basis)
+	}
+	events, err := h.request(http.MethodGet, "/cases/"+caseA+"/events", nil)
+	if err != nil {
+		return err
+	}
+	if !hasEvent(events.Body, "regulation_superseded") {
+		return errors.New("regulation_superseded audit event is missing")
+	}
+
+	// A new case pins R2; publishing R3 flags both unfinished cases.
+	deviceB, err := h.createDevice("MET-1502")
+	if err != nil {
+		return err
+	}
+	openedB, err := h.openCase(deviceB)
+	if err != nil {
+		return err
+	}
+	caseB, err := nestedString(openedB.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	pinnedB, err := nestedString(openedB.Body, "case", "regulation_version_id")
+	if err != nil {
+		return err
+	}
+	if pinnedB != secondRegulation {
+		return fmt.Errorf("case B pinned %q, expected %q", pinnedB, secondRegulation)
+	}
+	third, err := h.publishRegulation("Bench Meter", "R3", 25.0, 0.1)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(third, http.StatusCreated); err != nil {
+		return err
+	}
+	thirdRegulation, err := nestedString(third.Body, "regulation", "id")
+	if err != nil {
+		return err
+	}
+	supersededAgain, err := nestedSlice(third.Body, "superseded_cases")
+	if err != nil {
+		return err
+	}
+	if len(supersededAgain) != 2 {
+		return fmt.Errorf("superseded_cases = %v, expected both open cases", supersededAgain)
+	}
+	readB, err := h.request(http.MethodGet, "/cases/"+caseB, nil)
+	if err != nil {
+		return err
+	}
+	flaggedB, err := nestedString(readB.Body, "case", "superseded_by_regulation_id")
+	if err != nil {
+		return err
+	}
+	if flaggedB != thirdRegulation {
+		return fmt.Errorf("case B superseded_by = %q, expected %q", flaggedB, thirdRegulation)
+	}
+	return nil
+}
+
 func checkSealVerification() error {
 	h := newHarness()
 	defer h.close()
 
+	regulationID, err := h.mustPublish("Bench Meter", "R1", 25.0, 0.5)
+	if err != nil {
+		return err
+	}
 	caseID, err := h.readyCase("MET-1401")
 	if err != nil {
 		return err
@@ -372,7 +751,76 @@ func checkSealVerification() error {
 	if sealID == "" {
 		return errors.New("evidence seal is missing")
 	}
-	return nil
+	sealRegulation, err := nestedString(read.Body, "seal", "regulation_version_id")
+	if err != nil {
+		return err
+	}
+	if sealRegulation != regulationID {
+		return fmt.Errorf("seal recorded regulation %q, expected %q", sealRegulation, regulationID)
+	}
+
+	// Sealed evidence is immutable: a later regulation release must not
+	// flag or otherwise rewrite the sealed case.
+	published, err := h.publishRegulation("Bench Meter", "R2", 25.0, 0.1)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(published, http.StatusCreated); err != nil {
+		return err
+	}
+	superseded, err := nestedSlice(published.Body, "superseded_cases")
+	if err != nil {
+		return err
+	}
+	if len(superseded) != 0 {
+		return fmt.Errorf("sealed case was retroactively flagged: %v", superseded)
+	}
+	reread, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reread, http.StatusOK); err != nil {
+		return err
+	}
+	if _, err := nestedString(reread.Body, "case", "superseded_by_regulation_id"); err == nil {
+		return errors.New("sealed case gained a superseded flag after R2 was published")
+	}
+	sealedBasis, err := nestedString(reread.Body, "seal", "regulation_version_id")
+	if err != nil {
+		return err
+	}
+	if sealedBasis != regulationID {
+		return fmt.Errorf("sealed evidence regulation changed to %q", sealedBasis)
+	}
+	basis, err := nestedString(reread.Body, "regulation", "revision")
+	if err != nil {
+		return err
+	}
+	if basis != "R1" {
+		return fmt.Errorf("sealed case detail regulation revision = %q, expected R1", basis)
+	}
+
+	reopen, err := h.request(http.MethodPost, "/cases/"+caseID+"/reopen", map[string]any{
+		"actor":  "Lin",
+		"reason": "attempt to rewrite sealed evidence",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reopen, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(reopen, "state_conflict"); err != nil {
+		return err
+	}
+	measure, err := h.recordMeasurement(caseID, 25.1, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(measure, http.StatusConflict); err != nil {
+		return err
+	}
+	return expectErrorCode(measure, "state_conflict")
 }
 
 func newHarness() *harness {
@@ -440,13 +888,36 @@ func (h *harness) createDevice(tag string) (string, error) {
 	return nestedString(response.Body, "device", "id")
 }
 
+func (h *harness) publishRegulation(model, revision string, nominal, tolerance float64) (apiResponse, error) {
+	return h.request(http.MethodPost, "/regulations", map[string]any{
+		"device_model": model,
+		"revision":     revision,
+		"nominal":      nominal,
+		"tolerance":    tolerance,
+		"issued_by":    "Qi",
+	})
+}
+
+func (h *harness) mustPublish(model, revision string, nominal, tolerance float64) (string, error) {
+	response, err := h.publishRegulation(model, revision, nominal, tolerance)
+	if err != nil {
+		return "", err
+	}
+	if err := expectStatus(response, http.StatusCreated); err != nil {
+		return "", err
+	}
+	return nestedString(response.Body, "regulation", "id")
+}
+
 func (h *harness) openCase(deviceID string) (apiResponse, error) {
-	response, err := h.request(http.MethodPost, "/cases", map[string]any{
+	return h.request(http.MethodPost, "/cases", map[string]any{
 		"device_id": deviceID,
-		"nominal":   25.0,
-		"tolerance": 0.5,
 		"steward":   "Qiao",
 	})
+}
+
+func (h *harness) mustOpenCase(deviceID string) (apiResponse, error) {
+	response, err := h.openCase(deviceID)
 	if err != nil {
 		return apiResponse{}, err
 	}
@@ -468,7 +939,7 @@ func (h *harness) rejectedCase(tag string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	opened, err := h.openCase(deviceID)
+	opened, err := h.mustOpenCase(deviceID)
 	if err != nil {
 		return "", err
 	}
@@ -491,7 +962,7 @@ func (h *harness) readyCase(tag string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	opened, err := h.openCase(deviceID)
+	opened, err := h.mustOpenCase(deviceID)
 	if err != nil {
 		return "", err
 	}
@@ -527,16 +998,28 @@ func expectErrorCode(response apiResponse, expected string) error {
 	return nil
 }
 
-func nestedString(root map[string]any, path ...string) (string, error) {
-	value, err := nestedValue(root, path...)
+func nestedString(root map[string]any, path ...any) (string, error) {
+	value, err := nestedAny(root, path...)
 	if err != nil {
 		return "", err
 	}
 	text, ok := value.(string)
 	if !ok {
-		return "", fmt.Errorf("%s is not a string", strings.Join(path, "."))
+		return "", fmt.Errorf("%v is not a string", path)
 	}
 	return text, nil
+}
+
+func nestedFloat(root map[string]any, path ...any) (float64, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return 0, err
+	}
+	number, ok := value.(float64)
+	if !ok {
+		return 0, fmt.Errorf("%v is not a number", path)
+	}
+	return number, nil
 }
 
 func nestedBool(root map[string]any, path ...any) (bool, error) {
@@ -580,12 +1063,16 @@ func hasEvent(root map[string]any, kind string) bool {
 	return false
 }
 
-func nestedValue(root map[string]any, path ...string) (any, error) {
-	parts := make([]any, 0, len(path))
-	for _, part := range path {
-		parts = append(parts, part)
+func firstToAfterOrEqual(later, earlier string) bool {
+	laterTime, err := time.Parse(time.RFC3339Nano, later)
+	if err != nil {
+		return false
 	}
-	return nestedAny(root, parts...)
+	earlierTime, err := time.Parse(time.RFC3339Nano, earlier)
+	if err != nil {
+		return false
+	}
+	return !laterTime.Before(earlierTime)
 }
 
 func nestedAny(root map[string]any, path ...any) (any, error) {
