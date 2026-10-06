@@ -3,7 +3,9 @@ package repository
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
+	"time"
 
 	"example.com/solo-0021-metrology-assurance-suite/internal/domain"
 )
@@ -14,6 +16,7 @@ type Repository struct {
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	regulations  map[string]domain.RegulationVersion
 	events       []domain.AuditEvent
 	counters     map[string]int
 }
@@ -24,6 +27,7 @@ func New() *Repository {
 		cases:        make(map[string]domain.VerificationCase),
 		measurements: make(map[string][]domain.Measurement),
 		seals:        make(map[string]domain.EvidenceSeal),
+		regulations:  make(map[string]domain.RegulationVersion),
 		counters:     make(map[string]int),
 	}
 }
@@ -33,6 +37,7 @@ type Snapshot struct {
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	regulations  map[string]domain.RegulationVersion
 	events       []domain.AuditEvent
 }
 
@@ -62,6 +67,26 @@ func (s Snapshot) Measurements(caseID string) []domain.Measurement {
 func (s Snapshot) Seal(caseID string) (domain.EvidenceSeal, bool) {
 	item, ok := s.seals[caseID]
 	return item, ok
+}
+
+func (s Snapshot) Regulation(id string) (domain.RegulationVersion, bool) {
+	item, ok := s.regulations[id]
+	return item, ok
+}
+
+func (s Snapshot) Regulations() []domain.RegulationVersion {
+	result := make([]domain.RegulationVersion, 0, len(s.regulations))
+	for _, item := range s.regulations {
+		result = append(result, item)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		left, right := domain.NormalizeDeviceModel(result[i].DeviceModel), domain.NormalizeDeviceModel(result[j].DeviceModel)
+		if left != right {
+			return left < right
+		}
+		return result[i].Version < result[j].Version
+	})
+	return result
 }
 
 func (s Snapshot) Events(caseID string) []domain.AuditEvent {
@@ -95,6 +120,7 @@ type Mutation struct {
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	regulations  map[string]domain.RegulationVersion
 	events       []domain.AuditEvent
 	counters     map[string]int
 }
@@ -164,6 +190,26 @@ func (m *Mutation) ActiveCaseForDevice(deviceID string) (domain.VerificationCase
 	return domain.VerificationCase{}, false
 }
 
+// UnfinishedCasesForModel returns every unfinished case of the given device
+// model in a deterministic order, so a regulation publication can flag the
+// affected cases without touching sealed evidence.
+func (m *Mutation) UnfinishedCasesForModel(model string) []domain.VerificationCase {
+	deviceIDs := make(map[string]bool)
+	for _, device := range m.devices {
+		if domain.SameDeviceModel(device.Model, model) {
+			deviceIDs[device.ID] = true
+		}
+	}
+	var result []domain.VerificationCase
+	for _, item := range m.cases {
+		if deviceIDs[item.DeviceID] && item.IsUnfinished() {
+			result = append(result, item)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+	return result
+}
+
 func (m *Mutation) AppendMeasurement(item domain.Measurement) error {
 	if _, exists := m.cases[item.CaseID]; !exists {
 		return fmt.Errorf("%w: case %s", domain.ErrNotFound, item.CaseID)
@@ -187,6 +233,63 @@ func (m *Mutation) PutSeal(item domain.EvidenceSeal) error {
 	}
 	m.seals[item.CaseID] = item
 	return nil
+}
+
+func (m *Mutation) Regulation(id string) (domain.RegulationVersion, bool) {
+	item, ok := m.regulations[id]
+	return item, ok
+}
+
+func (m *Mutation) PutRegulation(item domain.RegulationVersion) error {
+	if _, exists := m.regulations[item.ID]; exists {
+		return fmt.Errorf("%w: regulation %s", domain.ErrStateConflict, item.ID)
+	}
+	m.regulations[item.ID] = item
+	return nil
+}
+
+// UpdateRegulation exists solely to close the effective boundary of a
+// superseded version; regulation content is otherwise immutable.
+func (m *Mutation) UpdateRegulation(item domain.RegulationVersion) error {
+	if _, exists := m.regulations[item.ID]; !exists {
+		return fmt.Errorf("%w: regulation %s", domain.ErrNotFound, item.ID)
+	}
+	m.regulations[item.ID] = item
+	return nil
+}
+
+// LatestRegulationForModel returns the most recently published version for
+// the device model, regardless of its effective boundary.
+func (m *Mutation) LatestRegulationForModel(model string) (domain.RegulationVersion, bool) {
+	var latest domain.RegulationVersion
+	found := false
+	for _, item := range m.regulations {
+		if !domain.SameDeviceModel(item.DeviceModel, model) {
+			continue
+		}
+		if !found || item.Version > latest.Version {
+			latest = item
+			found = true
+		}
+	}
+	return latest, found
+}
+
+// RegulationForModelAt resolves the version whose effective boundary covers
+// the given time for the device model.
+func (m *Mutation) RegulationForModelAt(model string, at time.Time) (domain.RegulationVersion, bool) {
+	var best domain.RegulationVersion
+	found := false
+	for _, item := range m.regulations {
+		if !domain.SameDeviceModel(item.DeviceModel, model) || !item.IsEffectiveAt(at) {
+			continue
+		}
+		if !found || item.Version > best.Version {
+			best = item
+			found = true
+		}
+	}
+	return best, found
 }
 
 func (m *Mutation) AppendEvent(item domain.AuditEvent) {
@@ -224,6 +327,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
+		regulations:  cloneRegulations(r.regulations),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 		counters:     cloneCounters(r.counters),
 	}
@@ -234,6 +338,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	r.cases = next.cases
 	r.measurements = next.measurements
 	r.seals = next.seals
+	r.regulations = next.regulations
 	r.events = next.events
 	r.counters = next.counters
 	return nil
@@ -245,6 +350,7 @@ func (r *Repository) snapshot() Snapshot {
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
+		regulations:  cloneRegulations(r.regulations),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 	}
 }
@@ -275,6 +381,14 @@ func cloneMeasurements(values map[string][]domain.Measurement) map[string][]doma
 
 func cloneSeals(values map[string]domain.EvidenceSeal) map[string]domain.EvidenceSeal {
 	result := make(map[string]domain.EvidenceSeal, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneRegulations(values map[string]domain.RegulationVersion) map[string]domain.RegulationVersion {
+	result := make(map[string]domain.RegulationVersion, len(values))
 	for key, value := range values {
 		result[key] = value
 	}

@@ -33,6 +33,38 @@ func (s *Server) device(writer http.ResponseWriter, request *http.Request) {
 	writeJSON(writer, http.StatusOK, contracts.DeviceResponse{Device: device})
 }
 
+func (s *Server) publishRegulation(writer http.ResponseWriter, request *http.Request) {
+	input, err := decodeJSON[contracts.PublishRegulationRequest](writer, request)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	view, err := s.service.PublishRegulation(request.Context(), input)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusCreated, view)
+}
+
+func (s *Server) regulation(writer http.ResponseWriter, request *http.Request) {
+	item, err := s.service.Regulation(request.Context(), request.PathValue("id"))
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, contracts.RegulationResponse{Regulation: item})
+}
+
+func (s *Server) regulations(writer http.ResponseWriter, request *http.Request) {
+	items, err := s.service.Regulations(request.Context(), request.URL.Query().Get("device_model"))
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, contracts.RegulationsResponse{Regulations: items})
+}
+
 func (s *Server) openCase(writer http.ResponseWriter, request *http.Request) {
 	input, err := decodeJSON[contracts.OpenCaseRequest](writer, request)
 	if err != nil {
@@ -77,6 +109,20 @@ func (s *Server) reopenCase(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	view, err := s.service.ReopenCase(request.Context(), request.PathValue("id"), input)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, view)
+}
+
+func (s *Server) resolveRegulation(writer http.ResponseWriter, request *http.Request) {
+	input, err := decodeJSON[contracts.ResolveRegulationRequest](writer, request)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	view, err := s.service.ResolveRegulation(request.Context(), request.PathValue("id"), input)
 	if err != nil {
 		writeError(writer, err)
 		return

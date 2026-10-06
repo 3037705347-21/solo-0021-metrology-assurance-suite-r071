@@ -77,6 +77,129 @@ func (s *Service) Device(ctx context.Context, id string) (domain.Device, error) 
 	return found, err
 }
 
+// PublishRegulation appends the next regulation version for a device model.
+// The previous version's effective boundary closes at the new version's
+// effective start, and every unfinished case of that model that is still
+// aligned with an older version is flagged superseded in the same atomic
+// commit. Sealed cases are evidence and are never rewritten.
+func (s *Service) PublishRegulation(ctx context.Context, input contracts.PublishRegulationRequest) (contracts.PublishRegulationResponse, error) {
+	var result contracts.PublishRegulationResponse
+	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+		model := strings.TrimSpace(input.DeviceModel)
+		if model == "" {
+			return fmt.Errorf("%w: device model is required", domain.ErrInvalidInput)
+		}
+		effectiveFrom := s.now()
+		if input.EffectiveFrom != nil {
+			effectiveFrom = input.EffectiveFrom.UTC()
+		}
+		version := 1
+		if latest, exists := m.LatestRegulationForModel(model); exists {
+			if !effectiveFrom.After(latest.EffectiveFrom) {
+				return fmt.Errorf("%w: effective_from must be later than the effective start of regulation %s", domain.ErrInvalidInput, latest.ID)
+			}
+			version = latest.Version + 1
+			superseded := latest
+			if err := superseded.Supersede(effectiveFrom); err != nil {
+				return err
+			}
+			if err := m.UpdateRegulation(superseded); err != nil {
+				return err
+			}
+		}
+		item, err := domain.NewRegulationVersion(
+			m.NextID("regulation"),
+			model,
+			version,
+			input.Tolerance,
+			effectiveFrom,
+			input.PublishedBy,
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		if err := m.PutRegulation(item); err != nil {
+			return err
+		}
+		event, err := domain.NewAuditEvent(
+			m.NextID("event"),
+			"regulation",
+			item.ID,
+			"",
+			"regulation_published",
+			item.PublishedBy,
+			fmt.Sprintf("regulation version %d published for device model %s with tolerance %g", item.Version, item.DeviceModel, item.Tolerance),
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		m.AppendEvent(event.WithRegulation(item.ID))
+		supersededCases := []string{}
+		for _, open := range m.UnfinishedCasesForModel(model) {
+			if open.RegulationVersionID == item.ID || open.RegulationStatus != domain.RegulationCurrent {
+				continue
+			}
+			if err := open.MarkRegulationSuperseded(s.now()); err != nil {
+				return err
+			}
+			if err := m.UpdateCase(open); err != nil {
+				return err
+			}
+			caseEvent, err := domain.NewAuditEvent(
+				m.NextID("event"),
+				"case",
+				open.ID,
+				open.ID,
+				"regulation_superseded",
+				item.PublishedBy,
+				fmt.Sprintf("regulation %s was published; case remains pinned to %s and requires a regulation decision", item.ID, open.RegulationVersionID),
+				s.now(),
+			)
+			if err != nil {
+				return err
+			}
+			m.AppendEvent(caseEvent.WithRegulation(open.RegulationVersionID))
+			supersededCases = append(supersededCases, open.ID)
+		}
+		result = contracts.PublishRegulationResponse{
+			Regulation:        item,
+			SupersededCaseIDs: supersededCases,
+		}
+		return nil
+	})
+	return result, err
+}
+
+func (s *Service) Regulation(ctx context.Context, id string) (domain.RegulationVersion, error) {
+	var found domain.RegulationVersion
+	err := s.repository.Read(ctx, func(snapshot repository.Snapshot) error {
+		item, exists := snapshot.Regulation(strings.TrimSpace(id))
+		if !exists {
+			return fmt.Errorf("%w: regulation %s", domain.ErrNotFound, id)
+		}
+		found = item
+		return nil
+	})
+	return found, err
+}
+
+func (s *Service) Regulations(ctx context.Context, deviceModel string) ([]domain.RegulationVersion, error) {
+	result := []domain.RegulationVersion{}
+	model := strings.TrimSpace(deviceModel)
+	err := s.repository.Read(ctx, func(snapshot repository.Snapshot) error {
+		for _, item := range snapshot.Regulations() {
+			if model != "" && !domain.SameDeviceModel(item.DeviceModel, model) {
+				continue
+			}
+			result = append(result, item)
+		}
+		return nil
+	})
+	return result, err
+}
+
 func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest) (contracts.CaseResponse, error) {
 	var result contracts.CaseResponse
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
@@ -91,16 +214,26 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 		if active, exists := m.ActiveCaseForDevice(device.ID); exists {
 			return fmt.Errorf("%w: case %s is still %s", domain.ErrActiveCaseExists, active.ID, active.State)
 		}
+		regulation, exists := m.RegulationForModelAt(device.Model, s.now())
+		if !exists {
+			return fmt.Errorf("%w: device model %s has no effective regulation version", domain.ErrRegulationNotFound, device.Model)
+		}
 		item, err := domain.NewVerificationCase(
 			m.NextID("case"),
 			device.ID,
 			input.Nominal,
-			input.Tolerance,
+			regulation.Tolerance,
 			input.Steward,
+			regulation.ID,
 			s.now(),
 		)
 		if err != nil {
 			return err
+		}
+		// A newer version that is published but not yet effective still makes
+		// the pinned basis outdated, so the case opens needing a decision.
+		if latest, ok := m.LatestRegulationForModel(device.Model); ok && latest.ID != regulation.ID {
+			item.RegulationStatus = domain.RegulationSuperseded
 		}
 		if err := m.PutCase(item); err != nil {
 			return err
@@ -112,13 +245,13 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 			item.ID,
 			"case_opened",
 			item.Steward,
-			"verification case opened",
+			fmt.Sprintf("verification case opened under regulation %s (tolerance %g)", regulation.ID, regulation.Tolerance),
 			s.now(),
 		)
 		if err != nil {
 			return err
 		}
-		m.AppendEvent(event)
+		m.AppendEvent(event.WithRegulation(regulation.ID))
 		result = caseResponse(m, item)
 		return nil
 	})
@@ -152,6 +285,7 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 			input.Observed,
 			item.Nominal,
 			item.Tolerance,
+			item.RegulationVersionID,
 			input.Technician,
 			s.now(),
 		)
@@ -186,7 +320,7 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		if err != nil {
 			return err
 		}
-		m.AppendEvent(event)
+		m.AppendEvent(event.WithRegulation(measurement.RegulationVersionID))
 		result = caseResponse(m, item)
 		return nil
 	})
@@ -232,6 +366,68 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 	return result, err
 }
 
+// ResolveRegulation records the explicit steward decision for a case whose
+// pinned regulation version was superseded: keep the pinned version
+// (grandfathered) or adopt the latest published version for the device model.
+func (s *Service) ResolveRegulation(ctx context.Context, caseID string, input contracts.ResolveRegulationRequest) (contracts.CaseResponse, error) {
+	var result contracts.CaseResponse
+	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+		id := strings.TrimSpace(caseID)
+		item, exists := m.Case(id)
+		if !exists {
+			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
+		}
+		actor := strings.TrimSpace(input.Actor)
+		reason := strings.TrimSpace(input.Reason)
+		if actor == "" || reason == "" {
+			return fmt.Errorf("%w: actor and reason are required", domain.ErrInvalidInput)
+		}
+		var detail string
+		switch strings.TrimSpace(input.Decision) {
+		case contracts.DecisionKeepPinned:
+			if err := item.ResolveRegulationKeep(s.now()); err != nil {
+				return err
+			}
+			detail = fmt.Sprintf("keep pinned regulation %s: %s", item.RegulationVersionID, reason)
+		case contracts.DecisionAdoptLatest:
+			device, ok := m.Device(item.DeviceID)
+			if !ok {
+				return fmt.Errorf("%w: device %s", domain.ErrNotFound, item.DeviceID)
+			}
+			latest, ok := m.LatestRegulationForModel(device.Model)
+			if !ok {
+				return fmt.Errorf("%w: device model %s has no regulation version", domain.ErrRegulationNotFound, device.Model)
+			}
+			if err := item.ResolveRegulationAdopt(latest.ID, latest.Tolerance, s.now()); err != nil {
+				return err
+			}
+			detail = fmt.Sprintf("adopt regulation %s: %s", latest.ID, reason)
+		default:
+			return fmt.Errorf("%w: decision must be %s or %s", domain.ErrInvalidInput, contracts.DecisionKeepPinned, contracts.DecisionAdoptLatest)
+		}
+		if err := m.UpdateCase(item); err != nil {
+			return err
+		}
+		event, err := domain.NewAuditEvent(
+			m.NextID("event"),
+			"case",
+			item.ID,
+			item.ID,
+			"regulation_decision",
+			actor,
+			detail,
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		m.AppendEvent(event.WithRegulation(item.RegulationVersionID))
+		result = caseResponse(m, item)
+		return nil
+	})
+	return result, err
+}
+
 func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.SealCaseRequest) (contracts.CaseResponse, error) {
 	var result contracts.CaseResponse
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
@@ -255,6 +451,7 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			item.ID,
 			item.DeviceID,
 			measurement.ID,
+			item.RegulationVersionID,
 			input.Reviewer,
 			input.Summary,
 			s.now(),
@@ -281,7 +478,7 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		if err != nil {
 			return err
 		}
-		m.AppendEvent(event)
+		m.AppendEvent(event.WithRegulation(seal.RegulationVersionID))
 		result = caseResponse(m, item)
 		return nil
 	})
@@ -309,6 +506,9 @@ func caseResponse(m *repository.Mutation, item domain.VerificationCase) contract
 		Measurements: m.Measurements(item.ID),
 		Events:       m.Events(item.ID),
 	}
+	if regulation, exists := m.Regulation(item.RegulationVersionID); exists {
+		result.Regulation = &regulation
+	}
 	if seal, exists := m.Seal(item.ID); exists {
 		result.Seal = &seal
 	}
@@ -320,6 +520,9 @@ func caseResponseFromSnapshot(snapshot repository.Snapshot, item domain.Verifica
 		Case:         item,
 		Measurements: snapshot.Measurements(item.ID),
 		Events:       snapshot.Events(item.ID),
+	}
+	if regulation, exists := snapshot.Regulation(item.RegulationVersionID); exists {
+		result.Regulation = &regulation
 	}
 	if seal, exists := snapshot.Seal(item.ID); exists {
 		result.Seal = &seal

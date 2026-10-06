@@ -40,6 +40,7 @@ func main() {
 		"record-measurement":       checkRecordMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
+		"regulation-versioning":    checkRegulationVersioning,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -120,6 +121,23 @@ func checkOpenVerificationCase() error {
 	if err != nil {
 		return err
 	}
+	unregulated, err := h.request(http.MethodPost, "/cases", map[string]any{
+		"device_id": deviceID,
+		"nominal":   25.0,
+		"steward":   "Qiao",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(unregulated, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(unregulated, "regulation_missing"); err != nil {
+		return err
+	}
+	if _, err := h.publishRegulation("Bench Meter", 0.5); err != nil {
+		return err
+	}
 	opened, err := h.openCase(deviceID)
 	if err != nil {
 		return err
@@ -147,7 +165,6 @@ func checkOpenVerificationCase() error {
 	second, err := h.request(http.MethodPost, "/cases", map[string]any{
 		"device_id": deviceID,
 		"nominal":   25.0,
-		"tolerance": 0.5,
 		"steward":   "Qiao",
 	})
 	if err != nil {
@@ -163,6 +180,9 @@ func checkRecordMeasurement() error {
 	h := newHarness()
 	defer h.close()
 
+	if _, err := h.publishRegulation("Bench Meter", 0.5); err != nil {
+		return err
+	}
 	deviceID, err := h.createDevice("MET-1201")
 	if err != nil {
 		return err
@@ -375,6 +395,343 @@ func checkSealVerification() error {
 	return nil
 }
 
+func checkRegulationVersioning() error {
+	h := newHarness()
+	defer h.close()
+
+	deviceA, err := h.createDevice("MET-1501")
+	if err != nil {
+		return err
+	}
+	unregulated, err := h.request(http.MethodPost, "/cases", map[string]any{
+		"device_id": deviceA,
+		"nominal":   25.0,
+		"steward":   "Qiao",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(unregulated, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(unregulated, "regulation_missing"); err != nil {
+		return err
+	}
+
+	regV1, err := h.publishRegulation("Bench Meter", 0.5)
+	if err != nil {
+		return err
+	}
+	opened, err := h.openCase(deviceA)
+	if err != nil {
+		return err
+	}
+	case1, err := nestedString(opened.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	if err := expectCaseRegulation(opened.Body, regV1, "current", 0.5); err != nil {
+		return fmt.Errorf("case1 open: %w", err)
+	}
+	accepted, err := h.recordMeasurement(case1, 25.2, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(accepted, http.StatusCreated); err != nil {
+		return err
+	}
+	measurementReg, err := nestedStringAt(accepted.Body, "measurements", 0, "regulation_version_id")
+	if err != nil {
+		return err
+	}
+	if measurementReg != regV1 {
+		return fmt.Errorf("measurement judged under %q, expected %q", measurementReg, regV1)
+	}
+
+	deviceB, err := h.createDevice("MET-1502")
+	if err != nil {
+		return err
+	}
+	openedB, err := h.openCase(deviceB)
+	if err != nil {
+		return err
+	}
+	case2, err := nestedString(openedB.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+
+	regV2, err := h.publishRegulation("Bench Meter", 0.1)
+	if err != nil {
+		return err
+	}
+	pub2, err := h.request(http.MethodGet, "/regulations/"+regV2, nil)
+	if err != nil {
+		return err
+	}
+	version2, err := nestedNumber(pub2.Body, "regulation", "version")
+	if err != nil {
+		return err
+	}
+	if version2 != 2 {
+		return fmt.Errorf("second publication version = %v, expected 2", version2)
+	}
+	v1View, err := h.request(http.MethodGet, "/regulations/"+regV1, nil)
+	if err != nil {
+		return err
+	}
+	if _, err := nestedString(v1View.Body, "regulation", "effective_to"); err != nil {
+		return fmt.Errorf("superseded regulation %s has no effective end boundary: %w", regV1, err)
+	}
+
+	blocked, err := h.request(http.MethodPost, "/cases/"+case1+"/seal", map[string]any{
+		"reviewer": "Vera",
+		"summary":  "attempted seal under superseded regulation",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(blocked, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(blocked, "regulation_resolution_required"); err != nil {
+		return err
+	}
+	view1, err := h.request(http.MethodGet, "/cases/"+case1, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectCaseRegulation(view1.Body, regV1, "superseded", 0.5); err != nil {
+		return fmt.Errorf("case1 after revision: %w", err)
+	}
+
+	kept, err := h.request(http.MethodPost, "/cases/"+case1+"/regulation", map[string]any{
+		"decision": "keep_pinned",
+		"actor":    "Lin",
+		"reason":   "field campaign started under the previous regulation",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(kept, http.StatusOK); err != nil {
+		return err
+	}
+	if err := expectCaseRegulation(kept.Body, regV1, "grandfathered", 0.5); err != nil {
+		return fmt.Errorf("case1 keep_pinned: %w", err)
+	}
+	sealed, err := h.request(http.MethodPost, "/cases/"+case1+"/seal", map[string]any{
+		"reviewer": "Vera",
+		"summary":  "sealed under the pinned regulation version",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealed, http.StatusCreated); err != nil {
+		return err
+	}
+	sealReg, err := nestedString(sealed.Body, "seal", "regulation_version_id")
+	if err != nil {
+		return err
+	}
+	if sealReg != regV1 {
+		return fmt.Errorf("seal regulation = %q, expected pinned %q", sealReg, regV1)
+	}
+	sealedEvents, err := nestedSlice(sealed.Body, "events")
+	if err != nil {
+		return err
+	}
+
+	adopted, err := h.request(http.MethodPost, "/cases/"+case2+"/regulation", map[string]any{
+		"decision": "adopt_latest",
+		"actor":    "Lin",
+		"reason":   "re-baseline to the current regulation before measuring",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(adopted, http.StatusOK); err != nil {
+		return err
+	}
+	if err := expectCaseRegulation(adopted.Body, regV2, "current", 0.1); err != nil {
+		return fmt.Errorf("case2 adopt_latest: %w", err)
+	}
+	rejected, err := h.recordMeasurement(case2, 25.2, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(rejected, http.StatusCreated); err != nil {
+		return err
+	}
+	rejectedValue, err := nestedBool(rejected.Body, "measurements", 0, "accepted")
+	if err != nil {
+		return err
+	}
+	if rejectedValue {
+		return errors.New("measurement within the old tolerance was accepted under the adopted regulation")
+	}
+	rejectedReg, err := nestedStringAt(rejected.Body, "measurements", 0, "regulation_version_id")
+	if err != nil {
+		return err
+	}
+	if rejectedReg != regV2 {
+		return fmt.Errorf("adopted measurement judged under %q, expected %q", rejectedReg, regV2)
+	}
+
+	pub3, err := h.request(http.MethodPost, "/regulations", map[string]any{
+		"device_model": "Bench Meter",
+		"tolerance":    0.05,
+		"published_by": "Lin",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(pub3, http.StatusCreated); err != nil {
+		return err
+	}
+	regV3, err := nestedString(pub3.Body, "regulation", "id")
+	if err != nil {
+		return err
+	}
+	affected, err := nestedSlice(pub3.Body, "superseded_case_ids")
+	if err != nil {
+		return err
+	}
+	if len(affected) != 1 || affected[0] != case2 {
+		return fmt.Errorf("third publication superseded %v, expected only %s", affected, case2)
+	}
+
+	sealedView, err := h.request(http.MethodGet, "/cases/"+case1, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectCaseRegulation(sealedView.Body, regV1, "grandfathered", 0.5); err != nil {
+		return fmt.Errorf("sealed case1 after third publication: %w", err)
+	}
+	sealedState, err := nestedString(sealedView.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if sealedState != "sealed" {
+		return fmt.Errorf("sealed case state = %q", sealedState)
+	}
+	sealedViewEvents, err := nestedSlice(sealedView.Body, "events")
+	if err != nil {
+		return err
+	}
+	if len(sealedViewEvents) != len(sealedEvents) {
+		return fmt.Errorf("sealed case gained %d events after the third publication", len(sealedViewEvents)-len(sealedEvents))
+	}
+
+	timeline, err := h.request(http.MethodGet, "/cases/"+case1+"/events", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(timeline, http.StatusOK); err != nil {
+		return err
+	}
+	for _, kind := range []string{"case_opened", "regulation_superseded", "regulation_decision", "case_sealed"} {
+		event := findEvent(timeline.Body, kind)
+		if event == nil {
+			return fmt.Errorf("sealed case timeline is missing %s", kind)
+		}
+		if event["regulation_version_id"] != regV1 {
+			return fmt.Errorf("event %s regulation = %v, expected %s", kind, event["regulation_version_id"], regV1)
+		}
+	}
+
+	deviceC, err := h.createDevice("MET-1503")
+	if err != nil {
+		return err
+	}
+	openedC, err := h.openCase(deviceC)
+	if err != nil {
+		return err
+	}
+	if err := expectCaseRegulation(openedC.Body, regV3, "current", 0.05); err != nil {
+		return fmt.Errorf("case3 open: %w", err)
+	}
+	case3, err := nestedString(openedC.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+
+	invalid, err := h.request(http.MethodPost, "/cases/"+case2+"/regulation", map[string]any{
+		"decision": "whatever",
+		"actor":    "Lin",
+		"reason":   "not a real decision",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(invalid, http.StatusBadRequest); err != nil {
+		return err
+	}
+	if err := expectErrorCode(invalid, "invalid_input"); err != nil {
+		return err
+	}
+	unneeded, err := h.request(http.MethodPost, "/cases/"+case3+"/regulation", map[string]any{
+		"decision": "keep_pinned",
+		"actor":    "Lin",
+		"reason":   "case is already on the latest regulation",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(unneeded, http.StatusConflict); err != nil {
+		return err
+	}
+	return expectErrorCode(unneeded, "state_conflict")
+}
+
+func expectCaseRegulation(body map[string]any, regulationID, status string, tolerance float64) error {
+	pinned, err := nestedString(body, "case", "regulation_version_id")
+	if err != nil {
+		return err
+	}
+	if pinned != regulationID {
+		return fmt.Errorf("pinned regulation = %q, expected %q", pinned, regulationID)
+	}
+	actualStatus, err := nestedString(body, "case", "regulation_status")
+	if err != nil {
+		return err
+	}
+	if actualStatus != status {
+		return fmt.Errorf("regulation status = %q, expected %q", actualStatus, status)
+	}
+	actualTolerance, err := nestedNumber(body, "case", "tolerance")
+	if err != nil {
+		return err
+	}
+	if actualTolerance != tolerance {
+		return fmt.Errorf("tolerance = %v, expected %v", actualTolerance, tolerance)
+	}
+	embedded, err := nestedString(body, "regulation", "id")
+	if err != nil {
+		return err
+	}
+	if embedded != regulationID {
+		return fmt.Errorf("embedded regulation = %q, expected %q", embedded, regulationID)
+	}
+	return nil
+}
+
+func findEvent(root map[string]any, kind string) map[string]any {
+	items, err := nestedSlice(root, "events")
+	if err != nil {
+		return nil
+	}
+	for _, item := range items {
+		event, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if event["kind"] == kind {
+			return event
+		}
+	}
+	return nil
+}
+
 func newHarness() *harness {
 	server := httptest.NewServer(bootstrap.NewHandler())
 	return &harness{
@@ -444,7 +801,6 @@ func (h *harness) openCase(deviceID string) (apiResponse, error) {
 	response, err := h.request(http.MethodPost, "/cases", map[string]any{
 		"device_id": deviceID,
 		"nominal":   25.0,
-		"tolerance": 0.5,
 		"steward":   "Qiao",
 	})
 	if err != nil {
@@ -456,6 +812,21 @@ func (h *harness) openCase(deviceID string) (apiResponse, error) {
 	return response, nil
 }
 
+func (h *harness) publishRegulation(model string, tolerance float64) (string, error) {
+	response, err := h.request(http.MethodPost, "/regulations", map[string]any{
+		"device_model": model,
+		"tolerance":    tolerance,
+		"published_by": "Lin",
+	})
+	if err != nil {
+		return "", err
+	}
+	if err := expectStatus(response, http.StatusCreated); err != nil {
+		return "", err
+	}
+	return nestedString(response.Body, "regulation", "id")
+}
+
 func (h *harness) recordMeasurement(caseID string, observed float64, technician string) (apiResponse, error) {
 	return h.request(http.MethodPost, "/cases/"+caseID+"/measurements", map[string]any{
 		"observed":   observed,
@@ -464,6 +835,9 @@ func (h *harness) recordMeasurement(caseID string, observed float64, technician 
 }
 
 func (h *harness) rejectedCase(tag string) (string, error) {
+	if _, err := h.publishRegulation("Bench Meter", 0.5); err != nil {
+		return "", err
+	}
 	deviceID, err := h.createDevice(tag)
 	if err != nil {
 		return "", err
@@ -487,6 +861,9 @@ func (h *harness) rejectedCase(tag string) (string, error) {
 }
 
 func (h *harness) readyCase(tag string) (string, error) {
+	if _, err := h.publishRegulation("Bench Meter", 0.5); err != nil {
+		return "", err
+	}
 	deviceID, err := h.createDevice(tag)
 	if err != nil {
 		return "", err
@@ -549,6 +926,30 @@ func nestedBool(root map[string]any, path ...any) (bool, error) {
 		return false, fmt.Errorf("%v is not a boolean", path)
 	}
 	return flag, nil
+}
+
+func nestedStringAt(root map[string]any, path ...any) (string, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return "", err
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%v is not a string", path)
+	}
+	return text, nil
+}
+
+func nestedNumber(root map[string]any, path ...any) (float64, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return 0, err
+	}
+	number, ok := value.(float64)
+	if !ok {
+		return 0, fmt.Errorf("%v is not a number", path)
+	}
+	return number, nil
 }
 
 func nestedSlice(root map[string]any, key string) ([]any, error) {
